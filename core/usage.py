@@ -9,8 +9,8 @@ if TYPE_CHECKING:
     from core.llm_client import LLMResponse
 
 
-@dataclass
-class UsageMeter:
+@dataclass(eq=False)  # Se identifica por instancia: dos medidores con los mismos totales
+class UsageMeter:  # no son el mismo (track() los quita de la lista por identidad).
     """Acumula el uso de las respuestas exitosas. Los intentos fallidos no cuentan."""
 
     calls: int = 0
