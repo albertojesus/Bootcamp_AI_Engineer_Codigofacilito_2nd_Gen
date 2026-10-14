@@ -7,6 +7,7 @@ El Agente Operador es un asistente para el equipo de operaciones de una empresa 
 - **Clase 1:** el núcleo (`core/`): un cliente LLM que habla con varios proveedores mediante el patrón adaptador, con reintentos, fallback, costo por llamada y logging estructurado.
 - **Clase 2:** prompts versionados (`prompting/`, `prompts/`), contexto con presupuesto de tokens (`context/`) y pruebas de prompt injection.
 - **Clase 3:** salida estructurada con contratos Pydantic y reparación (`contracts/`), y el primer tool call (`tools/`).
+- **Clase 4:** agentes escritos a mano (`agents/`): ReAct y plan-and-execute, con presupuesto, motivos de parada y traza.
 
 ## Qué se construye en cada bloque
 
@@ -65,6 +66,10 @@ uv run main.py --prompt ticket_classifier "El ERP no abre desde la mañana"     
 # Salida estructurada y herramientas (Clase 3)
 uv run main.py --structured --ticket T-1042
 uv run main.py --tools "¿Cómo va el T-1042?"
+
+# Agentes (Clase 4)
+uv run main.py --agent react "Compara el estado del T-1042 y el T-1014: ¿cuál va más avanzado?"
+uv run main.py --agent plan "Compara el estado del T-1042 y el T-1014: ¿cuál va más avanzado?"
 ```
 
 Cada llamada imprime la respuesta y una línea gris con `proveedor · modelo · tokens in/out · latencia · costo`, y agrega una línea JSON por intento a `logs/llm_calls.jsonl`. Con `--prompt`, el log incluye `prompt_name` y `prompt_version`.
@@ -83,6 +88,13 @@ uv run scripts/compare_prompts.py ticket_classifier --versions 2 --provider olla
 # Muestra cómo el ContextManager recorta un historial largo (no llama al LLM)
 uv run scripts/context_demo.py
 uv run scripts/context_demo.py --budget-history 120
+
+# Salida estructurada: texto libre vs json_schema vs Pydantic con reparación (Clase 3)
+uv run scripts/compare_structured.py
+uv run scripts/compare_structured.py --limit 8 --modes texto pydantic
+
+# Tool loop vs ReAct vs plan-and-execute (Clase 4)
+uv run scripts/compare_agents.py --repeat 3
 ```
 
 `compare_prompts.py` usa un solo proveedor sin fallback (el primario o el de `--provider`). `main.py --prompt` usa solo el primario si la cadena de fallbacks no se puede armar (por ejemplo, mientras `GroqProvider` esté pendiente).
@@ -138,6 +150,11 @@ flowchart LR
 | `contracts/tool_schemas.py` | `ToolSpec` y `BUSCAR_TICKET`: qué recibe cada herramienta y cómo se describe |
 | `contracts/tool_loop.py` | `run_tool_loop` y `execute_tool`: el ciclo de herramientas con `MAX_ITERS` |
 | `tools/tickets.py` | `buscar_ticket` sobre `data/tickets_db.json` |
+| `core/usage.py` | `UsageMeter`: llamadas, tokens, costo y latencia dentro de `LLMClient.track()` |
+| `agents/budget.py` | `AgentBudget` y `StopReason`: límites del agente y motivos de parada |
+| `agents/trace.py` | `TraceStep` y `AgentResult`: la traza y el resultado de un recorrido |
+| `agents/react_agent.py` | `AgentStep` y `ReActAgent`: el ciclo ReAct |
+| `agents/planner.py` | `Paso`, `Plan` y `PlanAndExecute`: planner, executors, replan y síntesis |
 
 ## Clase 2: prompt engineering y context engineering
 
@@ -206,6 +223,61 @@ uv run main.py --tools "¿Cómo va el T-9999?"     # la herramienta regresa un e
 
 Cada llamada queda en `logs/llm_calls.jsonl` con `structured_schema` y `repair_attempt` (salida estructurada) o `tool_iteration` y `tool_calls` (solo los **nombres** de las herramientas pedidas, nunca sus argumentos).
 
+## Clase 4: qué es un agente (ReAct y plan-and-execute)
+
+**Workflow vs agente.** En un workflow, el código decide el orden de los pasos y el modelo solo llena huecos (como el triage de la Clase 3). En un agente, el modelo decide el siguiente paso con lo que va observando. Eso da flexibilidad y también riesgo: un agente necesita límites explícitos para no dar vueltas, gastar de más o colgarse.
+
+**ReAct** (`agents/react_agent.py`). Un ciclo de *razonar → actuar → observar*. En cada paso el modelo devuelve un `AgentStep` estructurado (`pensamiento`, `accion`, `herramienta`, `argumentos_json`, `respuesta`), validado con `generate_structured` de la Clase 3. Si pide una herramienta, `execute_tool` la ejecuta y la observación entra a la `<traza>` del siguiente paso. El contexto se reconstruye en cada paso y las observaciones de más de 1,500 caracteres se recortan.
+
+**Plan-and-execute** (`agents/planner.py`). Primero el planner produce un `Plan` de 1 a 5 pasos sin ejecutar nada. Después, cada paso lo resuelve un `ReActAgent` con presupuesto local (`max_pasos=2`) y los resultados anteriores como contexto. Si un paso falla (sin respuesta o con `error`), se replanea una vez. Al final, una síntesis arma la respuesta. El presupuesto global cubre todo: planner, executors, replan y síntesis.
+
+### Motivos de parada y presupuesto
+
+`AgentBudget` se consulta **antes** de cada paso. Valores por defecto: `max_pasos=6`, `max_tokens=12_000`, `max_usd=0.02` y `max_segundos=45`.
+
+| Motivo | Cuándo |
+|---|---|
+| `respuesta` | El modelo eligió `responder`: terminó bien |
+| `max_pasos` | Se llegó al máximo de pasos |
+| `presupuesto` | Se llegó al máximo de tokens o de USD |
+| `sin_progreso` | Repitió la misma herramienta con los mismos argumentos (práctica guiada) |
+| `timeout` | Se acabó el tiempo |
+| `error` | El modelo no produjo un paso válido tras las reparaciones, o el proveedor falló |
+
+Cada llamada queda en `logs/llm_calls.jsonl` con `agent_kind` (`react` o `plan`), `agent_run_id` y `agent_step`. El último evento de cada recorrido lleva además `stop_reason`. El uso de un recorrido se mide con `LLMClient.track()` (`core/usage.py`).
+
+### Comandos
+
+```bash
+uv run main.py --agent react "Compara el estado del T-1042 y el T-1014: ¿cuál va más avanzado?"
+uv run main.py --agent plan "Compara el estado del T-1042 y el T-1014: ¿cuál va más avanzado?"
+uv run main.py --agent react --verbose "¿Cómo va el T-9999?"   # pensamientos y observaciones completas
+
+# Tool loop (Clase 3) vs ReAct vs plan-and-execute con 4 preguntas fijas
+uv run scripts/compare_agents.py
+uv run scripts/compare_agents.py --repeat 3
+```
+
+Salida real de `--agent react` con `gemini-3.5-flash-lite` (con `plan`, antes se imprime el plan):
+
+```
+[1] buscar_ticket T-1042   [2] buscar_ticket T-1014   [3] responder
+El ticket T-1042 está en estado "en revisión" con un reembolso ya en proceso, mientras que el T-1014 está en estado "esperando proveedor" [...]. Por lo tanto, el T-1042 va más avanzado en su resolución.
+motivo: respuesta · 3 llamadas · 2,301 tokens · $0.001509
+```
+
+Referencia de `compare_agents.py` (una corrida, `gemini-3.5-flash-lite`, sin `consultar_proveedor`):
+
+| modo | pregunta | llamadas | tokens | costo |
+|---|---|---|---|---|
+| tool_loop | dos tickets | 2 | 849 | $0.00045 |
+| react | dos tickets | 3 | 2,211 | $0.00140 |
+| plan | dos tickets | 6 | 3,771 | $0.00275 |
+
+Las tres respondieron bien; la diferencia es cuánto cuesta llegar. Un agente vale la pena cuando la tarea necesita decidir sobre la marcha, no por defecto.
+
+Si el motivo no es `respuesta`, la CLI lo explica y termina con código de salida 2. T-1042 y T-1014 dependen del mismo proveedor (PagosRed).
+
 ## Retos
 
 ### Reto de la Clase 1: proveedor de respaldo y reporte
@@ -253,6 +325,22 @@ Opcional: migra el system prompt de `main.py` (busca `TODO(clase-2)`) a `prompts
    uv run main.py --tools "¿El T-1042 depende de algún proveedor? ¿Cuál es su SLA?"
    ```
    Está listo cuando `logs/llm_calls.jsonl` muestra las dos herramientas (`buscar_ticket` y `consultar_proveedor`) en la misma request.
+
+### Práctica guiada de la Clase 4: detectar `sin_progreso`
+
+1. Escribe un test en `tests/test_budget.py` (o `tests/test_react_agent.py`) con un `FakeProvider` que repita la misma acción: `buscar_ticket` con `{"ticket_id": "T-1042"}` dos pasos seguidos. Debe fallar.
+2. Impleméntalo en `AgentBudget.exhausted` (`agents/budget.py`, busca `TODO(clase-4)`): si los dos últimos pasos usan la misma herramienta con los mismos argumentos, regresa `"sin_progreso"`.
+3. Confirma que el agente lo usa: `ReActAgent` ya consulta `exhausted` antes de cada paso, y el test debe pasar.
+4. Provócalo con una pregunta real y lee la traza con `--verbose`:
+   ```bash
+   uv run main.py --agent react --verbose "Revisa el T-1042 varias veces hasta que cambie de estado"
+   ```
+
+### Reto para la Clase 5: un verificador
+
+1. Crea `agents/verifier.py` con el contrato `Verificacion(problemas: list[str], aprobada: bool)`.
+2. El verificador revisa que cada dato de la respuesta (IDs, estados, proveedores, SLA) aparezca en las observaciones de la traza. Si no aprueba, pide **una sola** corrección con la lista de problemas.
+3. Compara con y sin verificador en 5 preguntas: llamadas, tokens y cuántas respuestas se corrigieron.
 
 ## Avisos
 
