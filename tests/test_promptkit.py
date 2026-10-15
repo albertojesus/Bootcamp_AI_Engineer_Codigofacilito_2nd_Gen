@@ -44,16 +44,34 @@ def kit() -> PromptKit:
     return PromptKit(PROMPTS_ROOT)
 
 
-def test_loads_v1_and_v2(kit):
-    assert kit.versions("ticket_classifier") == [1, 2]
+def test_loads_all_versions(kit):
+    assert kit.versions("ticket_classifier") == [1, 2, 3]
     v1 = kit.get("ticket_classifier", 1)
     v2 = kit.get("ticket_classifier", 2)
     assert (v1.version, v2.version) == (1, 2)
-    assert v2.model_params == {"temperature": 0, "max_tokens": 10}
+    assert v2.model_params == {"temperature": 0, "max_tokens": 300}
 
 
-def test_get_without_version_returns_active_v2(kit):
-    assert kit.get("ticket_classifier").version == 2
+def test_get_without_version_returns_active_v3(kit):
+    assert kit.get("ticket_classifier").version == 3
+
+
+def test_v3_renders_few_shot_examples(kit):
+    system = kit.get("ticket_classifier", 3).render(**VARS)[0]["content"]
+    example = kit.get("ticket_classifier", 3).examples[0]
+    assert f"<ticket>{example['ticket']}</ticket> -> {example['categoria']}" in system
+
+
+def test_operator_assistant_keeps_old_system_prompt(kit):
+    messages = kit.get("operator_assistant").render(question="¿Cómo va el T-1042?")
+    assert messages == [
+        {
+            "role": "system",
+            "content": "Eres un asistente de operaciones de una empresa mediana. "
+            "Responde siempre en español, de forma clara y en máximo 3 oraciones.",
+        },
+        {"role": "user", "content": "¿Cómo va el T-1042?"},
+    ]
 
 
 def test_get_specific_version_even_if_inactive(kit):

@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from contracts import BUSCAR_TICKET, BuscarTicketArgs
+from contracts import BUSCAR_TICKET, CONSULTAR_PROVEEDOR, BuscarTicketArgs, ConsultarProveedorArgs
+from tools.proveedores import consultar_proveedor
 from tools.tickets import buscar_ticket
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,3 +85,35 @@ def test_tickets_db_keeps_class_one_tickets():
         if ticket["id"] in by_id:
             assert by_id[ticket["id"]]["asunto"] == ticket["asunto"]
             assert by_id[ticket["id"]]["descripcion"] == ticket["descripcion"]
+
+
+@pytest.mark.parametrize("nombre", ["PagosRed", "pagosred", "  PAGOSRED ", "Empaques del Bajio"])
+def test_consultar_proveedor_ignores_case_and_accents(nombre):
+    result = consultar_proveedor(ConsultarProveedorArgs(nombre=nombre))
+    assert "error" not in result
+    assert isinstance(result["sla_horas"], int)
+
+
+def test_consultar_proveedor_unknown_returns_clear_error():
+    result = consultar_proveedor(ConsultarProveedorArgs(nombre="Proveedor Fantasma"))
+    assert result["error"] == "proveedor Proveedor Fantasma no existe"
+    assert "PagosRed" in result["disponibles"]
+
+
+def test_consultar_proveedor_args_reject_short_names():
+    with pytest.raises(ValidationError):
+        ConsultarProveedorArgs(nombre="P")
+
+
+def test_consultar_proveedor_spec():
+    function = CONSULTAR_PROVEEDOR.to_openai()["function"]
+    assert function["name"] == "consultar_proveedor"
+    assert "buscar_ticket" in function["description"]
+    assert function["parameters"]["required"] == ["nombre"]
+
+
+def test_t1042_supplier_sla_via_tools():
+    ticket = buscar_ticket(BuscarTicketArgs(ticket_id="T-1042"))
+    proveedor = consultar_proveedor(ConsultarProveedorArgs(nombre=ticket["proveedor"]))
+    assert proveedor["nombre"] == ticket["proveedor"]
+    assert proveedor["sla_horas"] == 4
