@@ -20,6 +20,7 @@ from core.llm_client import ToolCall
 from prompting import PromptKit
 
 if TYPE_CHECKING:
+    from agents.tools import ToolRunner
     from contracts.tool_schemas import ToolSpec
     from core.llm_client import LLMClient
     from core.usage import UsageMeter
@@ -105,6 +106,7 @@ class ReActAgent:
         on_event: EventHandler | None = None,
         agent_kind: str = "react",
         run_id: str | None = None,
+        runner: ToolRunner | None = None,
     ) -> None:
         self.client = client
         self.tools = list(tools)
@@ -117,6 +119,9 @@ class ReActAgent:
         # y es él quien anota el motivo de parada en el log.
         self.agent_kind = agent_kind
         self._shared_run_id = run_id
+        # Clase 5: con runner, las herramientas pasan por su política (permiso, tope,
+        # timeout, reintentos). Sin runner, se ejecutan directo como en la Clase 4.
+        self.runner = runner
 
     def _emit(self, kind: str, **data: Any) -> None:
         if self.on_event:
@@ -164,7 +169,11 @@ class ReActAgent:
                 if paso.accion == "responder":
                     return self._finish(paso.respuesta, traza, "respuesta", total, run_id)
 
-                message = execute_tool(paso.as_tool_call(f"paso-{n}"), self.tools_by_name)
+                call = paso.as_tool_call(f"paso-{n}")
+                if self.runner and call.name in self.tools_by_name:
+                    message = self.runner.execute(call)
+                else:
+                    message = execute_tool(call, self.tools_by_name)
                 observacion = json.loads(message["content"])
                 traza.append(
                     TraceStep(
