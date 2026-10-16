@@ -10,6 +10,8 @@ Uso:
     uv run main.py --tools "¿Cómo va el T-1042?"
     uv run main.py --agent react "Compara el T-1042 y el T-1014"
     uv run main.py --agent plan "Compara el T-1042 y el T-1014"
+    uv run main.py --agent react --mcp "¿Cómo va el T-1042?"
+    uv run main.py --agent react --rol lectura "Marca el T-1042 como resuelto"
 """
 
 from __future__ import annotations
@@ -48,6 +50,8 @@ PROMPT_VARIABLES = {
     "operator_tools": {"company": "Acme Operaciones"},
 }
 TICKETS_DB_PATH = DATA_DIR / "tickets_db.json"
+# Clase 5: nombre, permiso, resultado e intentos de cada herramienta (nunca argumentos).
+TOOL_LOG_PATH = Path(__file__).parent / "logs" / "tool_calls.jsonl"
 
 # Herramientas disponibles en el modo --tools.
 TOOLS = [BUSCAR_TICKET, CONSULTAR_PROVEEDOR]
@@ -109,7 +113,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Con --agent, muestra pensamientos y observaciones completas.",
     )
+    parser.add_argument(
+        "--mcp",
+        action="store_true",
+        help="Con --agent, toma las herramientas del server MCP por stdio (Clase 5).",
+    )
+    parser.add_argument(
+        "--rol",
+        choices=("lectura", "operador"),
+        default="operador",
+        help="Con --agent, rol para el ToolRunner: lectura u operador (Clase 5).",
+    )
     args = parser.parse_args(argv)
+    if args.mcp and not args.agent:
+        parser.error("--mcp requiere --agent.")
     if args.agent and (args.structured or args.tools or args.prompt_name or args.demo):
         parser.error("--agent no se combina con --structured, --tools, --prompt ni --demo.")
     if args.agent and (args.prompt is None or args.ticket):
@@ -197,8 +214,18 @@ def describe_action(paso) -> str:
     return " ".join([paso.herramienta or "?", *(str(v) for v in values)]).strip()
 
 
-def run_agent(client: LLMClient, kind: str, question: str, verbose: bool) -> int:
+def run_agent(
+    client: LLMClient,
+    kind: str,
+    question: str,
+    verbose: bool,
+    *,
+    mcp: bool = False,
+    rol: str = "operador",
+) -> int:
     from agents import PlanAndExecute, ReActAgent
+    from agents.tools import ToolRunner
+    from contracts.tool_schemas import ACTUALIZAR_ESTADO
 
     actions: list[str] = []
 
@@ -219,7 +246,19 @@ def run_agent(client: LLMClient, kind: str, question: str, verbose: bool) -> int
             print(f"{GRAY}    ← {json.dumps(data['observacion'], ensure_ascii=False)}{RESET}")
 
     agent_cls = ReActAgent if kind == "react" else PlanAndExecute
-    result = agent_cls(client, TOOLS, on_event=on_event).run(question)
+    if mcp:
+        # El server MCP aplica su propio ToolRunner con OPERADOR_ROL.
+        from operador_mcp.client import MCPToolset
+
+        with MCPToolset(rol=rol) as toolset:
+            print(f"{GRAY}herramientas: MCP por stdio · rol {rol}{RESET}")
+            result = agent_cls(client, toolset.tools(), on_event=on_event).run(question)
+    else:
+        # El agente puede proponer actualizar_estado; el ToolRunner decide según el rol.
+        tools = [*TOOLS, *([] if ACTUALIZAR_ESTADO in TOOLS else [ACTUALIZAR_ESTADO])]
+        runner = ToolRunner(tools, rol=rol, log_path=TOOL_LOG_PATH)
+        print(f"{GRAY}herramientas: locales · rol {rol}{RESET}")
+        result = agent_cls(client, tools, on_event=on_event, runner=runner).run(question)
 
     if actions:
         print("   ".join(actions))
@@ -312,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
         return fail(str(e))
 
     if args.agent:
-        return run_agent(client, args.agent, text, args.verbose)
+        return run_agent(client, args.agent, text, args.verbose, mcp=args.mcp, rol=args.rol)
 
     if args.structured or args.tools:
         try:
