@@ -8,6 +8,8 @@ Uso:
     uv run main.py --prompt ticket_classifier --prompt-version 1 "No abre el ERP"
     uv run main.py --structured --ticket T-1042
     uv run main.py --tools "¿Cómo va el T-1042?"
+    uv run main.py --agent react "Compara el T-1042 y el T-1014"
+    uv run main.py --agent plan "Compara el T-1042 y el T-1014"
 """
 
 from __future__ import annotations
@@ -97,7 +99,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Responde la pregunta con herramientas, como buscar_ticket (Clase 3).",
     )
+    parser.add_argument(
+        "--agent",
+        choices=("react", "plan"),
+        help="Responde con un agente ReAct o plan-and-execute (Clase 4).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Con --agent, muestra pensamientos y observaciones completas.",
+    )
     args = parser.parse_args(argv)
+    if args.agent and (args.structured or args.tools or args.prompt_name or args.demo):
+        parser.error("--agent no se combina con --structured, --tools, --prompt ni --demo.")
+    if args.agent and (args.prompt is None or args.ticket):
+        parser.error('--agent necesita la pregunta como texto, por ejemplo "¿Cómo va el T-1042?".')
     if args.prompt is None and not (args.demo or args.ticket):
         parser.error("falta el texto a enviar (o usa --demo o --ticket).")
     if args.prompt_version is not None and not args.prompt_name:
@@ -158,6 +174,64 @@ def run_tools(client: LLMClient, question: str) -> int:
         **prompt.model_params,
     )
     print(answer.strip())
+    return 0
+
+
+STOP_MESSAGES = {
+    "max_pasos": "el agente llegó al máximo de pasos sin responder.",
+    "presupuesto": "el agente agotó su presupuesto de tokens o de costo.",
+    "sin_progreso": "el agente repitió la misma acción sin avanzar.",
+    "timeout": "el agente se quedó sin tiempo.",
+    "error": "el modelo no produjo un paso válido o el proveedor falló.",
+}
+
+
+def describe_action(paso) -> str:
+    """`buscar_ticket T-1042` o `responder`, para la línea de pasos."""
+    if paso.accion == "responder":
+        return "responder"
+    try:
+        values = json.loads(paso.argumentos_json or "{}").values()
+    except (ValueError, AttributeError):
+        values = [paso.argumentos_json]
+    return " ".join([paso.herramienta or "?", *(str(v) for v in values)]).strip()
+
+
+def run_agent(client: LLMClient, kind: str, question: str, verbose: bool) -> int:
+    from agents import PlanAndExecute, ReActAgent
+
+    actions: list[str] = []
+
+    def on_event(event: str, data: dict) -> None:
+        if event == "plan":
+            plan = data["plan"]
+            label = "replan" if data["replan"] else "plan"
+            print(f"{label}: {len(plan.pasos)} pasos")
+            for i, paso in enumerate(plan.pasos, start=1):
+                tool = f" ({paso.herramienta})" if paso.herramienta else ""
+                print(f"  {i}. {paso.objetivo}{tool}")
+        elif event == "paso":
+            paso = data["paso"]
+            actions.append(f"[{len(actions) + 1}] {describe_action(paso)}")
+            if verbose:
+                print(f"{GRAY}{actions[-1]} · {paso.pensamiento}{RESET}")
+        elif event == "observacion" and verbose:
+            print(f"{GRAY}    ← {json.dumps(data['observacion'], ensure_ascii=False)}{RESET}")
+
+    agent_cls = ReActAgent if kind == "react" else PlanAndExecute
+    result = agent_cls(client, TOOLS, on_event=on_event).run(question)
+
+    if actions:
+        print("   ".join(actions))
+    if result.respuesta:
+        print(result.respuesta.strip())
+    print(
+        f"{GRAY}motivo: {result.motivo} · {result.llamadas} llamadas · "
+        f"{result.tokens:,} tokens · ${result.cost_usd:.6f}{RESET}"
+    )
+    if result.motivo != "respuesta":
+        print(f"Aviso: {STOP_MESSAGES[result.motivo]}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -236,6 +310,9 @@ def main(argv: list[str] | None = None) -> int:
         return fail(config_error(e))
     except NotImplementedError as e:
         return fail(str(e))
+
+    if args.agent:
+        return run_agent(client, args.agent, text, args.verbose)
 
     if args.structured or args.tools:
         try:
