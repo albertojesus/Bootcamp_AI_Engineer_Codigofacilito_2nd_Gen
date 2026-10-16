@@ -25,3 +25,4 @@ logs/*.log
 # Estado local de las herramientas (se conserva var/.gitkeep)
 var/*.json
 var/*.tmp
+.mcp-inspector/

@@ -114,6 +114,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Con --agent, muestra pensamientos y observaciones completas.",
     )
     parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Con --agent, verifica la respuesta contra la traza y la corrige una vez.",
+    )
+    parser.add_argument(
         "--mcp",
         action="store_true",
         help="Con --agent, toma las herramientas del server MCP por stdio (Clase 5).",
@@ -125,6 +130,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Con --agent, rol para el ToolRunner: lectura u operador (Clase 5).",
     )
     args = parser.parse_args(argv)
+    if args.verify and not args.agent:
+        parser.error("--verify requiere --agent.")
     if args.mcp and not args.agent:
         parser.error("--mcp requiere --agent.")
     if args.agent and (args.structured or args.tools or args.prompt_name or args.demo):
@@ -219,11 +226,12 @@ def run_agent(
     kind: str,
     question: str,
     verbose: bool,
+    verify: bool = False,
     *,
     mcp: bool = False,
     rol: str = "operador",
 ) -> int:
-    from agents import PlanAndExecute, ReActAgent
+    from agents import PlanAndExecute, ReActAgent, verify_and_revise
     from agents.tools import ToolRunner
     from contracts.tool_schemas import ACTUALIZAR_ESTADO
 
@@ -259,14 +267,29 @@ def run_agent(
         runner = ToolRunner(tools, rol=rol, log_path=TOOL_LOG_PATH)
         print(f"{GRAY}herramientas: locales · rol {rol}{RESET}")
         result = agent_cls(client, tools, on_event=on_event, runner=runner).run(question)
+    respuesta, checked = result.respuesta, None
+    llamadas, tokens, cost_usd = result.llamadas, result.tokens, result.cost_usd
+    if verify and respuesta:
+        with client.track() as extra:
+            checked = verify_and_revise(client, question, respuesta, result.traza)
+        respuesta = checked.respuesta
+        llamadas += extra.calls
+        tokens += extra.tokens
+        cost_usd += extra.cost_usd
 
     if actions:
         print("   ".join(actions))
-    if result.respuesta:
-        print(result.respuesta.strip())
+    if checked:
+        if checked.corregida:
+            problems = "; ".join(checked.verificacion.problemas)
+            print(f"{GRAY}verificación: no aprobada ({problems}) → respuesta corregida{RESET}")
+        else:
+            print(f"{GRAY}verificación: aprobada{RESET}")
+    if respuesta:
+        print(respuesta.strip())
     print(
-        f"{GRAY}motivo: {result.motivo} · {result.llamadas} llamadas · "
-        f"{result.tokens:,} tokens · ${result.cost_usd:.6f}{RESET}"
+        f"{GRAY}motivo: {result.motivo} · {llamadas} llamadas · "
+        f"{tokens:,} tokens · ${cost_usd:.6f}{RESET}"
     )
     if result.motivo != "respuesta":
         print(f"Aviso: {STOP_MESSAGES[result.motivo]}", file=sys.stderr)
@@ -351,7 +374,9 @@ def main(argv: list[str] | None = None) -> int:
         return fail(str(e))
 
     if args.agent:
-        return run_agent(client, args.agent, text, args.verbose, mcp=args.mcp, rol=args.rol)
+        return run_agent(
+            client, args.agent, text, args.verbose, args.verify, mcp=args.mcp, rol=args.rol
+        )
 
     if args.structured or args.tools:
         try:
