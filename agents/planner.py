@@ -18,6 +18,7 @@ from prompting import PromptKit
 
 if TYPE_CHECKING:
     from agents.react_agent import EventHandler
+    from agents.tools import ToolRunner
     from contracts.tool_schemas import ToolSpec
     from core.llm_client import LLMClient
     from core.usage import UsageMeter
@@ -52,11 +53,13 @@ class PlanAndExecute:
         max_replans: int = 1,
         clock: Callable[[], float] = time.monotonic,
         on_event: EventHandler | None = None,
+        runner: ToolRunner | None = None,
     ) -> None:
         self.client = client
         self.tools = list(tools)
         self.budget = budget or AgentBudget()
         self.max_replans = max_replans
+        self.runner = runner  # Lo comparten todos los executors: un solo tope por herramienta.
         self.clock = clock
         self.on_event = on_event
         kit = PromptKit(PROMPTS_DIR)
@@ -149,6 +152,7 @@ class PlanAndExecute:
             on_event=self._forward,
             agent_kind="plan",
             run_id=run_id,
+            runner=self.runner,
         )
 
     def _execute(self, paso: Paso, resultados: list[str], run_id: str) -> AgentResult:
