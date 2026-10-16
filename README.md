@@ -8,6 +8,7 @@ El Agente Operador es un asistente para el equipo de operaciones de una empresa 
 - **Clase 2:** prompts versionados (`prompting/`, `prompts/`), contexto con presupuesto de tokens (`context/`) y pruebas de prompt injection.
 - **Clase 3:** salida estructurada con contratos Pydantic y reparación (`contracts/`), y el primer tool call (`tools/`).
 - **Clase 4:** agentes escritos a mano (`agents/`): ReAct y plan-and-execute, con presupuesto, motivos de parada y traza.
+- **Clase 5:** herramientas con política (`agents/tools.py`): permisos por rol, topes, timeout, reintentos y errores tipados; una herramienta de escritura idempotente y un server MCP (`operador_mcp/`).
 
 ## Qué se construye en cada bloque
 
@@ -70,6 +71,10 @@ uv run main.py --tools "¿Cómo va el T-1042?"
 # Agentes (Clase 4)
 uv run main.py --agent react "Compara el estado del T-1042 y el T-1014: ¿cuál va más avanzado?"
 uv run main.py --agent plan "Compara el estado del T-1042 y el T-1014: ¿cuál va más avanzado?"
+
+# Herramientas con política y MCP (Clase 5)
+uv run main.py --agent react --mcp "¿Cómo va el T-1042?"
+uv run main.py --agent react --rol lectura "Marca el T-1042 como resuelto"
 ```
 
 Cada llamada imprime la respuesta y una línea gris con `proveedor · modelo · tokens in/out · latencia · costo`, y agrega una línea JSON por intento a `logs/llm_calls.jsonl`. Con `--prompt`, el log incluye `prompt_name` y `prompt_version`.
@@ -155,6 +160,10 @@ flowchart LR
 | `agents/trace.py` | `TraceStep` y `AgentResult`: la traza y el resultado de un recorrido |
 | `agents/react_agent.py` | `AgentStep` y `ReActAgent`: el ciclo ReAct |
 | `agents/planner.py` | `Paso`, `Plan` y `PlanAndExecute`: planner, executors, replan y síntesis |
+| `agents/tools.py` | `ToolPolicy`, `POLITICAS`, `ROLES` y `ToolRunner`: el filtro antes de ejecutar una herramienta |
+| `operador_mcp/server.py` | Server MCP (`MCPServer`) con las herramientas, delegando en un `ToolRunner` |
+| `operador_mcp/client.py` | `MCPToolset`: lanza el server por stdio y expone sus tools como `ToolSpec` |
+| `var/` | Estado local de las herramientas (`var/*.json`, fuera de git) |
 
 ## Clase 2: prompt engineering y context engineering
 
@@ -278,6 +287,60 @@ Las tres respondieron bien; la diferencia es cuánto cuesta llegar. Un agente va
 
 Si el motivo no es `respuesta`, la CLI lo explica y termina con código de salida 2. T-1042 y T-1014 dependen del mismo proveedor (PagosRed).
 
+## Clase 5: tools y acciones, de herramientas locales a MCP
+
+**Diseño de herramientas.** Una herramienta es un contrato para el modelo: un nombre claro, una descripción que diga qué hace, cuándo usarla y cuándo **no**, y argumentos con tipos y restricciones (`contracts/tool_schemas.py`). La descripción de `actualizar_estado` dice que *fija* el estado (no lo alterna) y que no se use sin un pedido explícito del usuario.
+
+**Taxonomía de errores.** Toda herramienta regresa errores con la misma forma, `tool_error(tipo, mensaje, reintentable=..., sugerencia=...)`:
+
+| `tipo` | Qué significa | ¿Reintentar igual? |
+|---|---|---|
+| `validacion` | Argumentos inválidos o herramienta inexistente | Solo corrigiendo los argumentos |
+| `negocio` | La operación no tiene sentido (el ticket no existe) | No |
+| `transitorio` | Timeout o falla pasajera | Sí, si es idempotente (lo hace el runner) |
+| `permanente` | El handler falló de forma inesperada (el detalle va al log, no al modelo) | No |
+| `permiso` | El rol no puede usar esa herramienta | No |
+| `limite` | Se acabaron las llamadas permitidas en esta ejecución | No |
+
+**Idempotencia.** `actualizar_estado` fija un valor: llamarla dos veces con el mismo estado deja el mismo resultado y la segunda regresa `"cambio": false`. Por eso se puede reintentar sin miedo. Escribe en un overlay, `var/tickets_estado.json`, con escritura atómica; `data/tickets_db.json` nunca cambia y `buscar_ticket` aplica el overlay al leer.
+
+**`ToolPolicy` y roles** (`agents/tools.py`). Cada herramienta tiene un permiso (`lectura`, `escritura` o `peligrosa`), un timeout, si es idempotente y un máximo de llamadas por ejecución. El rol `lectura` solo puede leer; `operador` lee y escribe. Una herramienta sin política se trata como `peligrosa` y se niega, y `peligrosa` no se permite en ningún rol: la aprobación humana llega en la Clase 11. `ToolRunner.execute` revisa en este orden: permiso → llamadas restantes → argumentos → ejecución con timeout → reintento (0.5 s, 1 s) solo si el error es transitorio y la herramienta es idempotente. Cada ejecución se registra en `logs/tool_calls.jsonl` con `tool_name`, `tool_permiso`, `tool_resultado` y `tool_intentos`, nunca con los argumentos. El timeout corre el handler en un hilo: si se vence, dejamos de esperarlo, pero Python no puede matar el hilo.
+
+**MCP** (*Model Context Protocol*). Un estándar para que un **host** (la app con el modelo, aquí `main.py`) use herramientas de un **server** a través de un **client** que habla el protocolo. El server declara sus tools (nombre, descripción, `inputSchema`, annotations) y el cliente las lista con `tools/list` y las llama con `tools/call`. Con el transporte **stdio**, el host lanza el server como subproceso y se comunican por stdin/stdout. `operador_mcp/server.py` expone las mismas herramientas con el mismo `ToolRunner` (rol en `OPERADOR_ROL`, por defecto `lectura`), y `operador_mcp/client.py` (`MCPToolset`) las convierte en `ToolSpec` para el agente. Las annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) salen de la política; son pistas para el cliente, no seguridad.
+
+### Comandos
+
+```bash
+# Agente con herramientas locales y ToolRunner (rol operador por defecto)
+uv run main.py --agent react "¿Cómo va el T-1042?"
+uv run main.py --agent react --rol lectura "Marca el T-1042 como resuelto"   # error de permiso
+
+# Agente con las herramientas del server MCP por stdio
+uv run main.py --agent react --mcp "¿Cómo va el T-1042?"
+uv run main.py --agent react --mcp --rol operador "Marca el T-1042 como resuelto"
+
+# Server MCP solo (stdio) y el Inspector oficial para probarlo sin LLM
+uv run python -m operador_mcp.server
+npx @modelcontextprotocol/inspector uv run python -m operador_mcp.server
+```
+
+El server lleva la cuenta de `max_llamadas` mientras vive: en una sesión larga del Inspector, cada herramienta acepta 3 llamadas y después regresa `limite`. Reinicia el server para volver a empezar. Su stderr (logs) queda en `logs/mcp_server.log` cuando lo lanza `MCPToolset`. Para borrar los cambios de estado, borra `var/tickets_estado.json`.
+
+### Lo que verificamos en la documentación (16 de octubre de 2026)
+
+| Tema | Lo que dice la documentación | Diferencia con las slides |
+|---|---|---|
+| Versión del SDK | `mcp` 2.3.0 en PyPI ([migración a v2](https://py.sdk.modelcontextprotocol.io/migration/)) | Las slides usan la API v1 |
+| Declarar un server | `from mcp.server.mcpserver import MCPServer`; `MCPServer("agente-operador")` ([tools](https://py.sdk.modelcontextprotocol.io/servers/tools/)) | `FastMCP` se renombró a `MCPServer`; `mcp.server.fastmcp` ya no existe |
+| Registrar tools | `@mcp.tool()` o `mcp.add_tool(fn, name=, description=, annotations=)` | Usamos `add_tool` para tomar la descripción del `ToolSpec` |
+| Annotations | `ToolAnnotations(read_only_hint=..., destructive_hint=..., idempotent_hint=...)` de `mcp.types` | En Python son snake_case; en el protocolo siguen siendo `readOnlyHint`, etc. |
+| Errores de una tool | `raise ToolError(...)` → `is_error=True` con el mensaje en `content` ([errores](https://py.sdk.modelcontextprotocol.io/servers/handling-errors/)) | Una excepción inesperada solo manda `Error executing tool X` |
+| Cliente por stdio | `Client(StdioServerParameters(command=, args=, env=, cwd=))`; `stdio_client(params, errlog=...)` para redirigir stderr ([transportes](https://py.sdk.modelcontextprotocol.io/client/transports/)) | `ClientSession` sigue existiendo, pero la doc recomienda `Client`; el hijo no hereda el entorno salvo una lista mínima |
+| Respuesta de `call_tool` | `content`, `structured_content`, `is_error` (snake_case en Python, camelCase en el protocolo) ([spec, tools](https://modelcontextprotocol.io/specification/latest/server/tools)) | `structuredContent`/`isError` solo en el JSON |
+| Tools con `dict` | Un `dict[str, ...]` regresa como `structured_content` sin envolver ([salida estructurada](https://py.sdk.modelcontextprotocol.io/servers/structured-output/)) | — |
+| Transporte en memoria | `Client(server)` despacha directo, sin JSON-RPC ([testing](https://py.sdk.modelcontextprotocol.io/get-started/testing/)) | `tests/test_mcp.py` usa ambos: memoria y stdio real |
+| Especificación | Versión 2026-07-28: las annotations son pistas no confiables salvo de servers confiables | — |
+
 ## Retos
 
 ### Reto de la Clase 1: proveedor de respaldo y reporte
@@ -341,6 +404,24 @@ Opcional: migra el system prompt de `main.py` (busca `TODO(clase-2)`) a `prompts
 1. Crea `agents/verifier.py` con el contrato `Verificacion(problemas: list[str], aprobada: bool)`.
 2. El verificador revisa que cada dato de la respuesta (IDs, estados, proveedores, SLA) aparezca en las observaciones de la traza. Si no aprueba, pide **una sola** corrección con la lista de problemas.
 3. Compara con y sin verificador en 5 preguntas: llamadas, tokens y cuántas respuestas se corrigieron.
+
+### Práctica guiada de la Clase 5: `listar_tickets_por_proveedor`
+
+1. En `tools/tickets.py` (busca `TODO(clase-5)`), escribe `listar_tickets_por_proveedor(args)`: de solo lectura, regresa como máximo 10 tickets del proveedor (`id`, `asunto`, `estado`) y el `total` encontrado.
+2. En `contracts/tool_schemas.py`, crea `ListarTicketsPorProveedorArgs` y `LISTAR_TICKETS_POR_PROVEEDOR` con una descripción que diga cuándo usarla y cuándo no.
+3. En `agents/tools.py`, dale `ToolPolicy("lectura", timeout_s=2)`.
+4. En `operador_mcp/server.py` (busca `TODO(clase-5)`), expónla con `readOnlyHint`.
+5. Pruébala sin LLM (test y Inspector) y después con el agente:
+   ```bash
+   uv run main.py --agent react --mcp "¿Qué tickets tiene PagosRed?"
+   ```
+
+### Reto para la Clase 6: `crear_ticket` idempotente
+
+1. Crea `CrearTicketArgs(asunto, descripcion, prioridad)` y `crear_ticket`, que escribe en `var/tickets_nuevos.json` con IDs `T-2xxx`.
+2. La herramienta debe ser idempotente: si el agente la repite (por un reintento o porque dudó), no se crea un segundo ticket. Calcula una `idempotency_key` **en el código**, a partir del asunto y la descripción normalizados y de un `request_id` que el `ToolRunner` recibe de quien lo llama. Nunca la pidas al modelo.
+3. Dale `ToolPolicy("escritura", idempotente=True)` y expónla en el server MCP con sus annotations.
+4. Escribe el test: dos llamadas iguales con el mismo `request_id` crean un solo ticket.
 
 ## Avisos
 
