@@ -45,8 +45,8 @@ class ToolPolicy:
 POLITICAS: dict[str, ToolPolicy] = {
     "buscar_ticket": ToolPolicy("lectura", timeout_s=2),
     "actualizar_estado": ToolPolicy("escritura"),
-    # Si la base no tiene consultar_proveedor, esta política simplemente no se usa.
     "consultar_proveedor": ToolPolicy("lectura", timeout_s=2),
+    "listar_tickets_por_proveedor": ToolPolicy("lectura", timeout_s=2),
 }
 ROLES: dict[Rol, set[Permiso]] = {"lectura": {"lectura"}, "operador": {"lectura", "escritura"}}
 

@@ -233,7 +233,7 @@ def run_agent(
 ) -> int:
     from agents import PlanAndExecute, ReActAgent, verify_and_revise
     from agents.tools import ToolRunner
-    from contracts.tool_schemas import ACTUALIZAR_ESTADO
+    from contracts.tool_schemas import ACTUALIZAR_ESTADO, LISTAR_TICKETS_POR_PROVEEDOR
 
     actions: list[str] = []
 
@@ -263,7 +263,8 @@ def run_agent(
             result = agent_cls(client, toolset.tools(), on_event=on_event).run(question)
     else:
         # El agente puede proponer actualizar_estado; el ToolRunner decide según el rol.
-        tools = [*TOOLS, *([] if ACTUALIZAR_ESTADO in TOOLS else [ACTUALIZAR_ESTADO])]
+        extras = [ACTUALIZAR_ESTADO, LISTAR_TICKETS_POR_PROVEEDOR]
+        tools = [*TOOLS, *(tool for tool in extras if tool not in TOOLS)]
         runner = ToolRunner(tools, rol=rol, log_path=TOOL_LOG_PATH)
         print(f"{GRAY}herramientas: locales · rol {rol}{RESET}")
         result = agent_cls(client, tools, on_event=on_event, runner=runner).run(question)

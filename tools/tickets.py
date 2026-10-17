@@ -8,17 +8,23 @@ from __future__ import annotations
 
 import json
 import os
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from contracts.tool_schemas import ActualizarEstadoArgs, BuscarTicketArgs
+    from contracts.tool_schemas import (
+        ActualizarEstadoArgs,
+        BuscarTicketArgs,
+        ListarTicketsPorProveedorArgs,
+    )
 
 # Rutas fijas: nunca se construyen a partir de los argumentos del modelo.
 TICKETS_DB = Path(__file__).resolve().parents[1] / "data" / "tickets_db.json"
 ESTADOS_PATH = Path(__file__).resolve().parents[1] / "var" / "tickets_estado.json"
 HISTORY_LIMIT = 3
+LISTA_LIMITE = 10
 
 
 @lru_cache(maxsize=1)
@@ -78,5 +84,30 @@ def actualizar_estado(args: ActualizarEstadoArgs) -> dict:
     return {"id": args.ticket_id, "estado": args.estado, "cambio": cambio}
 
 
-# TODO(clase-5): práctica guiada. listar_tickets_por_proveedor(nombre) de solo lectura,
-# con tope de 10 resultados y el total encontrado.
+def _normalizar(texto: str) -> str:
+    """Minúsculas, sin acentos ni espacios alrededor: "  PAGOSRED " == "pagosred"."""
+    sin_acentos = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+    return sin_acentos.lower().strip()
+
+
+def listar_tickets_por_proveedor(args: ListarTicketsPorProveedorArgs) -> dict:
+    """Tickets de un proveedor (máximo 10) y el total encontrado. Solo lectura."""
+    buscado = _normalizar(args.nombre)
+    estados = _estados()
+    encontrados = [
+        ticket
+        for ticket in _tickets().values()
+        if ticket["proveedor"] and _normalizar(ticket["proveedor"]) == buscado
+    ]
+    return {
+        "proveedor": args.nombre,
+        "total": len(encontrados),
+        "tickets": [
+            {
+                "id": ticket["id"],
+                "asunto": ticket["asunto"],
+                "estado": estados.get(ticket["id"], ticket["estado"]),
+            }
+            for ticket in encontrados[:LISTA_LIMITE]
+        ],
+    }

@@ -26,7 +26,11 @@ import contracts.tool_schemas as schemas
 from agents.tools import ToolRunner
 from contracts.tool_schemas import ToolSpec
 
-SPECS: list[ToolSpec] = [schemas.BUSCAR_TICKET, schemas.ACTUALIZAR_ESTADO]
+SPECS: list[ToolSpec] = [
+    schemas.BUSCAR_TICKET,
+    schemas.ACTUALIZAR_ESTADO,
+    schemas.LISTAR_TICKETS_POR_PROVEEDOR,
+]
 if hasattr(schemas, "CONSULTAR_PROVEEDOR"):  # Solo si la base ya tiene el reto de la Clase 3.
     SPECS.append(schemas.CONSULTAR_PROVEEDOR)
 
@@ -66,10 +70,15 @@ def consultar_proveedor(nombre: str) -> dict[str, Any]:
     return _call("consultar_proveedor", nombre=nombre)
 
 
+def listar_tickets_por_proveedor(nombre: str) -> dict[str, Any]:
+    return _call("listar_tickets_por_proveedor", nombre=nombre)
+
+
 FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
     "buscar_ticket": buscar_ticket,
     "actualizar_estado": actualizar_estado,
     "consultar_proveedor": consultar_proveedor,
+    "listar_tickets_por_proveedor": listar_tickets_por_proveedor,
 }
 
 for spec in SPECS:
@@ -83,5 +92,3 @@ for spec in SPECS:
 
 if __name__ == "__main__":
     mcp.run()
-
-# TODO(clase-5): práctica guiada. Expón listar_tickets_por_proveedor con readOnlyHint.
